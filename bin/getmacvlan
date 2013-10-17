@@ -1,0 +1,103 @@
+#!/bin/sh
+
+# 
+# Find mac address for a given IP or hostname
+#
+# This script search the ARP table of the gateway
+# with SNMP
+#
+
+. /local/etc/where.conf
+
+. /local/lib/where.sh
+
+commfile="/local/var/cached_vlan_idx/.com"
+
+# MIB 2 OID
+base=".iso.org.dod.internet.mgmt.mib-2"
+
+# Functions
+die() {
+    echo "$*" >&2 && exit 1
+}
+
+#
+# Check argument
+#
+
+[ $# != 1 ] && die "Usage : $0 IP_address_or_hostname"
+
+#
+# Resolve name if needed
+#
+
+ip="$1"
+echo $ip | grep -q '^[0-9.]*$' || ip=$(host $1|sed -n '/.*has address /s///p')
+
+#
+# Get gateway IP address in database
+#
+
+router=$(psql -Aqtc "select gw4 from dns.network where addr4>>='$ip'")
+[ -z "$router" ] && die "router not found"
+
+#
+# Calculate previous address for VRRP
+#
+
+last=$(echo $router | sed 's/.*\.//')
+p_router=$(echo $router | sed "s/$last\$/$(expr $last - 1)/")
+
+#
+# Fetch mac address with SNMP
+#
+
+mac=$(
+  for r in $router $p_router ; do
+    community=$(getcomm $r)
+
+    #
+    # Find index of interface in ipAddrTable matching router address
+    #
+    var="$base.ip.ipAddrTable.ipAddrEntry.ipAdEntIfIndex.$r"
+    ifidx=`snmpget -v2c -c $community $router $var|sed 's/.* \([0-9]*\)/\1/'`
+    [ -z "$ifidx" ] && die "interface not found"
+
+    #
+    # Get MAC address in table ipNetToMediaTable
+    #
+    net2media="ip.ipNetToMediaTable.ipNetToMediaEntry.ipNetToMediaPhysAddress"
+    var="$base.$net2media.$ifidx.$ip"
+    snmpget -v2c -c $community $router $var | \
+	sed -n "/.* \([a-f0-9:][a-f0-9:]*\)$/s//\1/p"
+  done | sort -u
+)
+[ -z "$mac" ] && die "no mac found"
+echo -n $mac
+
+#
+# Fetch VLAN 
+#
+
+vlan=$(
+  for r in $router $p_router ; do
+    community=$(getcomm $r)
+    #
+    # Find index of interface in ipAddrTable matching router address
+    #
+    var="$base.ip.ipAddrTable.ipAddrEntry.ipAdEntIfIndex.$r"
+    ifidx=`snmpget -v2c -c $community $router $var|sed 's/.* \([0-9]*\)/\1/'`
+    [ -z "$ifidx" ] && die "interface not found"
+
+    #
+    # Get VLAN id from interface table
+    #
+    ifdescroid="interfaces.ifTable.ifEntry.ifDescr"
+    var="$base.$ifdescroid.$ifidx" 
+    snmpget -v2c -c $community $router $var | \
+        sed 's/.*[a-z.]\([0-9]*\)$/\1/'
+  done | sort -u
+)
+echo -n " $vlan"
+
+echo

@@ -1,0 +1,182 @@
+#! /bin/sh
+
+cachedir="/local/var/cached_vlan_idx"
+commfile="/local/var/cached_vlan_idx/.com"
+
+iftableoid="1.3.6.1.2.1.2.2.1.2"
+ifaliasoid="1.3.6.1.2.1.31.1.1.1.18"
+
+# Get vlan index for given equipement
+junvlanidx() {
+    local eq="$1"
+    local v="$2"
+
+    local vlanname="vlan_$v"
+
+    [ -f $cachedir/$eq ] && grep -w $vlanname $cachedir/$eq | awk '{print $1}'
+}
+
+# Get snp community
+getcom() {
+    sed -n "/^$eq /s///p" $commfile
+}
+
+# Convert MAC adresse MAC into index to form an OID
+mac2idx() {
+        echo "$1" | tr ':' '\n' | while read n ; do
+                printf ".%d" 0x$n
+        done
+}
+
+# Rewrite vlan number (when different vlans are bridged together)
+transvlan() {
+        local vlan="$1"
+
+        local nvlan=""
+        local file="$cachedir/.transvlan"
+
+        if [ -f $file ] ; then
+        nvlan=$(awk "/^$vlan /"' {print $2}' $file)
+                if [ -n "$nvlan" ] ; then
+                        vlan=$nvlan
+                fi
+        fi
+        echo $vlan
+}
+
+#
+# Guess equipement type
+#
+guesstype() {
+    local eq=$1
+    local community=$2
+
+    sysdescroid="1.3.6.1.2.1.1.1.0"
+
+    case $(snmpget -Ov -v2c -c "$community" $eq ".$sysdescroid") in
+      *cisco*) echo cisco ;;
+      *Juniper*) echo juniper ;;
+    esac
+}
+
+#
+# Get interface name
+#
+getifname() {
+    local eq=$1
+    local ifidx=$2
+    local community=$3
+
+    local ifname=$(snmpget -Ov -v2c -c "$community" $eq ".$iftableoid.$ifidx" | \
+            sed -n '/STRING: /s///p;q')
+    [ -n "$ifname" ] && echo $ifname
+}
+
+#
+# Get interface description
+#
+getifdescr() {
+    local eq=$1
+    local ifidx=$2
+    local ifname=$3
+    local community=$4
+
+    local ifdescr=$(
+	    snmpget -Ov -v2c -c "$community" $eq ".$ifaliasoid.$ifidx" | \
+		sed -n '/STRING: /s///p;q'
+	    )
+
+    if [ -z "$ifdescr" ] ; then
+	# Juniper only ?:
+	# Remove dot and number at the end of the interface name
+	# (escription for brdige interfaces is in the parente interface)
+	pifname=$(echo $ifname|sed -e 's/\.0//')
+
+	idx=$(snmpwalk -Oq -v2c -c "$community" "$eq" ".$iftableoid" | \
+	    sed -n -e 's/"//g' -e 's:.*\.\([0-9]*\) '$pifname'$:\1:p')
+	if [ -n "$idx" ] ; then
+	    ifdescr=$(
+		    snmpget -Ov -v2c -c "$community" $eq ".$ifaliasoid.$idx" | \
+			sed -n '/STRING: /s///p;q'
+		    )
+	fi
+    fi
+    [ -n "$ifdescr" ] && echo $ifdescr
+}
+
+#
+# Get interface index for given mac and vlan
+#
+getifidx() {
+    local eq=$1
+    local vlan=$2
+    local mac=$3
+    local community=$4
+
+    vlan=$(transvlan $vlan)
+
+    fwdtableoid="1.3.6.1.2.1.17.4.3.1.2"
+    brifoid="1.3.6.1.2.1.17.1.4.1.2"
+
+    type=$(guesstype $eq $community)
+
+    case "$type" in 
+        juniper)
+                vlanidx=$(junvlanidx $eq $vlan)
+                [ -n "$vlanidx" ] &&
+                    fwdtableoid="1.3.6.1.2.1.17.7.1.2.2.1.2.$vlanidx"
+                ;;
+        cisco)    community="$community@$vlan"
+                    ;;
+    esac
+
+    local macidx=$(mac2idx $mac)
+
+    # SNMPv2-SMI::mib-2.17.4.3.1.2.0.0.116.233.114.207 = INTEGER: 24
+    local brifidx=$(snmpget -Ov -v2c -c "$community" $eq ".$fwdtableoid$macidx" |
+            sed -n '/INTEGER: /s///p;q')
+    # Find correspondance between Interface ID in the Bridge MIB and
+    # Interface ID in the interface group in MIB2
+    [ -n "$brifidx" ] && 
+        local ifidx=$(snmpget -Ov -v2c -c "$community" $eq ".$brifoid.$brifidx" |
+            sed -n '/INTEGER: /s///p;q')
+    # Affiche l'index s'il a ete trouve
+    [ -n "$ifidx" ] && echo $ifidx
+}
+
+
+#
+# Get neighbour equipement name
+#
+neighbour() {
+    local eq=$1
+    local ifidx=$2
+    local community=$3
+
+    lldpremoteoid="iso.0.8802.1.1.2.1.4.1.1.9"
+    snmpwalk -Oq -v2c -c "$community" "$eq" ".$lldpremoteoid" | \
+	sed -n -e s/\"//g \
+	    -e "/$lldpremoteoid.[0-9]*\.$ifidx\.[0-9]* /s///p"
+}
+
+
+# seed equipment 
+# FIXME
+eq=espla-cc1
+
+mac=$1
+vlan=$2
+
+while [ -n "$eq" ] ; do
+    community=$(getcom $eq)
+    i=$(getifidx "$eq" "$vlan" "$mac" "$community")
+    if [ -n "$i" ] ; then
+      n=$(getifname "$eq" "$i" "$community")
+      d=$(getifdescr "$eq" "$i" "$n" "$community")
+    else
+      n=""
+      d=""
+    fi
+    echo "$eq $n '$d'"
+    eq=$(neighbour "$eq" "$i" "$community")
+done

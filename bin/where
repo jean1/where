@@ -1,0 +1,10 @@
+#!/bin/sh
+
+macvlan=$(/local/bin/getmacvlan $1)
+
+mac=$(echo $macvlan | sed 's/ .*//')
+vlan=$(echo $macvlan | sed 's/.* //')
+
+echo "MAC-ADDRESS: $mac VLAN: $vlan"
+/local/bin/grepmac $mac $vlan
+
